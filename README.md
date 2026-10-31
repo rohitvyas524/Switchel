@@ -10,6 +10,18 @@ A menu-bar file converter and toolbox for macOS. Drag files anywhere, hold a key
 
 1. Unzip and drag **Switchel.app** to your Applications folder.
 2. The app isn't notarized, so macOS blocks it the first time you open it. Go to **System Settings › Privacy & Security**, scroll down, and click **Open Anyway**. On macOS 14 you can instead right-click the app and choose **Open**. Or run `xattr -dr com.apple.quarantine /Applications/Switchel.app` in Terminal.
+3. **Install ffmpeg for audio and video.** Switchel doesn't include ffmpeg and won't install it for you. Without it, images, PDFs, documents, spreadsheets, subtitles and archives still work, but audio and video conversions and tools don't. To install it:
+   1. If you don't have [Homebrew](https://brew.sh), open Terminal and run the following. When it finishes, run the commands it prints under **Next steps** so `brew` works.
+      ```sh
+      /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+      ```
+   2. Install ffmpeg:
+      ```sh
+      brew install ffmpeg
+      ```
+   3. Optional: for WebP export, also run `brew install webp`.
+
+   **Settings › Engines** in Switchel shows whether ffmpeg was found.
 
 ## How it works
 
@@ -64,7 +76,7 @@ Switchel asks once for Automation permission the first time it uses Pages, Keyno
 Requires macOS 14+ on Apple silicon and Xcode 15+.
 
 ```sh
-swift test                  # 26 tests over every converter and tool engine (media tests need ffmpeg)
+swift test                  # 42 tests over every converter and tool engine (media tests need ffmpeg)
 ./scripts/build-app.sh      # → build/Switchel.app and build/Switchel.zip
 open build/Switchel.app
 ```
