@@ -90,3 +90,11 @@ To publish a release, attach `build/Switchel.zip` to a new GitHub release. Keep 
 - `Sources/SwitchelKit/Tools`: image, audio/video and PDF tool engines (no UI)
 - `Sources/SwitchelKit/Editors`: SwiftUI editor windows for the tools
 - `Sources/SwitchelKit/App`: drag monitor, wheel, Float shelf, settings, welcome wizard, menu bar
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to build, test and open a pull request.
+
+## License
+
+[MIT](LICENSE)
