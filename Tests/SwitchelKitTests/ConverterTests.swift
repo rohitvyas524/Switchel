@@ -311,7 +311,8 @@ final class PDFTests: FixtureCase {
     func testPDFToImages() async throws {
         let single = try makePDF("one.pdf", pages: 1)
         let png = try await PDFConverter.convert(single, to: .png)
-        XCTAssertEqual(pixelSize(png).0, 400 * 300 / 72)
+        let pageWidth = try XCTUnwrap(PDFDocument(url: single)?.page(at: 0)?.bounds(for: .mediaBox).width)
+        XCTAssertEqual(pixelSize(png).0, Int(pageWidth * 300 / 72), "300 DPI")
 
         let triple = try makePDF("three.pdf", pages: 3)
         let pages = try await PDFConverter.convert(triple, to: .jpg)
@@ -994,5 +995,118 @@ final class PictureFidelityTests: FixtureCase {
         XCTAssertTrue(doc.string?.contains("Gadgets and accessories") ?? false)
         XCTAssertTrue(doc.string?.contains("Quarterly Sales") ?? false)
         XCTAssertGreaterThan(PDFPageStyles(doc.page(at: 0)!.pageRef!).images.count, 0)
+    }
+}
+
+// MARK: Reported issues
+
+final class IssueTests: FixtureCase {
+    /// #9: a format change keeps the camera and location details.
+    func testConversionKeepsMetadata() async throws {
+        let heic = try await ImageConverter.convert(try makePhoto(), to: .heic)
+        let props = CGImageSourceCopyPropertiesAtIndex(CGImageSourceCreateWithURL(heic as CFURL, nil)!, 0, nil) as! [CFString: Any]
+        XCTAssertEqual((props[kCGImagePropertyTIFFDictionary] as? [CFString: Any])?[kCGImagePropertyTIFFMake] as? String, "TestCam")
+        XCTAssertNotNil(props[kCGImagePropertyGPSDictionary])
+    }
+
+    /// #8: a photo becomes a paper-sized page, not one point per pixel.
+    func testImagePDFUsesPaperSize() async throws {
+        let pdf = try await ImageConverter.convert(try makePhoto(), to: .pdf)
+        let box = try XCTUnwrap(PDFDocument(url: pdf)?.page(at: 0)?.bounds(for: .mediaBox))
+        XCTAssertLessThanOrEqual(max(box.width, box.height), 842)
+        XCTAssertGreaterThan(box.width, box.height, "landscape photo, landscape page")
+    }
+
+    /// #4: every page of a multipage TIFF becomes a PDF page.
+    func testMultipageTIFFKeepsPages() async throws {
+        let page = try ImageConverter.load(try makePNG())
+        let tiff = folder.appendingPathComponent("scan.tiff")
+        let dest = CGImageDestinationCreateWithURL(tiff as CFURL, UTType.tiff.identifier as CFString, 2, nil)!
+        CGImageDestinationAddImage(dest, page, nil)
+        CGImageDestinationAddImage(dest, page, nil)
+        XCTAssertTrue(CGImageDestinationFinalize(dest))
+        let pdf = try await ImageConverter.convert(tiff, to: .pdf)
+        XCTAssertEqual(PDFDocument(url: pdf)?.pageCount, 2)
+        XCTAssertEqual(PDFDocument(url: try ImageTools.combineIntoPDF([tiff, try makePNG("one.png")]))?.pageCount, 3)
+    }
+
+    /// #5: PNG compressed to a size is still a PNG.
+    func testCompressPNGToTargetSizeStaysPNG() async throws {
+        let limit = 300_000
+        let out = try await ImageTools.compress(try makePhoto(), .init(target: .maxBytes(limit), maxDimension: nil, format: .png))
+        XCTAssertEqual(out.pathExtension, "png")
+        XCTAssertEqual(typeOf(out), UTType.png.identifier)
+        XCTAssertLessThanOrEqual(size(out), limit)
+    }
+
+    /// #6: a plain gzipped, bzipped or xz file extracts to the file inside.
+    func testExtractsSingleCompressedFiles() async throws {
+        let text = folder.appendingPathComponent("notes.txt")
+        try "hello".write(to: text, atomically: true, encoding: .utf8)
+        try await Shell.run("/usr/bin/gzip", ["-k", text.path])
+        try await Shell.run("/usr/bin/bzip2", ["-k", text.path])
+        try await Shell.run("/usr/bin/compression_tool", ["-encode", "-a", "lzma", "-i", text.path, "-o", text.path + ".xz"])
+        try FileManager.default.removeItem(at: text)
+        for ext in ["gz", "bz2", "xz"] {
+            let out = try await ArchiveConverter.extract(folder.appendingPathComponent("notes.txt.\(ext)"))
+            XCTAssertEqual(try String(contentsOf: out), "hello", ext)
+            try FileManager.default.removeItem(at: out)
+        }
+        let zip = try await ArchiveConverter.convert(folder.appendingPathComponent("notes.txt.gz"), to: .zip)
+        let entries = try await zipEntries(zip)
+        XCTAssertEqual(entries, ["notes.txt"])
+    }
+
+    /// #9: names starting with "-" are archived as files, not read as options.
+    func testArchivesDashNames() async throws {
+        let project = folder.appendingPathComponent("project", isDirectory: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try "x".write(to: project.appendingPathComponent("-rf"), atomically: true, encoding: .utf8)
+        let zip = try await ArchiveConverter.convert(project, to: .zip)
+        let entries = try await zipEntries(zip)
+        XCTAssertTrue(entries.contains("project/-rf"))
+        let tar = try await ArchiveConverter.convert(zip, to: .gz)
+        let listing = String(decoding: try await Shell.run("/usr/bin/tar", ["-tzf", tar.path]), as: UTF8.self)
+        XCTAssertTrue(listing.contains("project/-rf"))
+    }
+
+    /// #7: Windows-1252 subtitles and CSVs convert instead of failing.
+    func testReadsWindows1252Text() async throws {
+        let srt = folder.appendingPathComponent("film.srt")
+        try "1\n00:00:01,000 --> 00:00:02,000\nCafé déjà vu\n".data(using: .windowsCP1252)!.write(to: srt)
+        let vtt = try SubtitleConverter.convert(srt, to: .vtt)
+        XCTAssertTrue(try String(contentsOf: vtt).contains("Café déjà vu"))
+
+        let csv = folder.appendingPathComponent("prices.csv")
+        try "item,price\nCrème brûlée,5\n".data(using: .windowsCP1252)!.write(to: csv)
+        let table = try await SpreadsheetConverter.read(csv)
+        XCTAssertEqual(table.last?.first, "Crème brûlée")
+    }
+
+    /// #2: tiny start times are written as plain decimals.
+    func testFFmpegTimesAvoidScientificNotation() {
+        XCTAssertEqual(FFmpeg.time(0.00001), "0.000010")
+        XCTAssertEqual(FFmpeg.time(-1), "0.000000")
+        XCTAssertEqual(FFmpeg.time(62.5), "62.500000")
+    }
+
+    /// #2, #3, #9: trimming from near zero, a snapshot at the very end, merging with a silent clip, and size targets.
+    func testVideoEdgeCases() async throws {
+        let source = try await makeVideo()
+        try await expectDuration(VideoTools.trim(source, 0.00001...1), 1)
+
+        let end = try await duration(source)
+        let shot = try await VideoTools.snapshots(source, at: [end], as: .png)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: shot[0].path))
+
+        let silent = try await VideoTools.removeAudio(try await makeVideo("silent.mov"))
+        let merged = try await VideoTools.merge([source, silent])
+        let mergedHasAudio = await FFmpeg.hasAudio(merged)
+        XCTAssertTrue(mergedHasAudio)
+        try await expectDuration(merged, 4, accuracy: 0.3)
+
+        let target = 0.3
+        let compressed = try await VideoTools.compress(source, .init(targetMegabytes: target))
+        XCTAssertLessThanOrEqual(Double(size(compressed)), target * 1_000_000)
     }
 }

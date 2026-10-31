@@ -101,3 +101,17 @@ enum Output {
         return url
     }
 }
+
+extension String {
+    /// Reads a user's text file: UTF-8 or a marked encoding when possible, otherwise Windows-1252,
+    /// which covers most older subtitles and spreadsheet exports. Latin-1 decodes any byte as a last resort.
+    init(readingText url: URL) throws {
+        var encoding = String.Encoding.utf8
+        if let text = try? String(contentsOf: url, usedEncoding: &encoding) { self = text; return }
+        let data = try Data(contentsOf: url)
+        for fallback in [String.Encoding.utf8, .windowsCP1252, .isoLatin1] {
+            if let text = String(data: data, encoding: fallback) { self = text; return }
+        }
+        throw SwitchelError("Couldn't read the text in \(url.lastPathComponent)")
+    }
+}

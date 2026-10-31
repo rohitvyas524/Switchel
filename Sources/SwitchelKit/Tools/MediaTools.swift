@@ -41,17 +41,26 @@ enum VideoTools {
         }
         let out = Output.url(for: url, ext: "mp4", suffix: "compressed")
         let scale = options.maxHeight.map { "scale=-2:'trunc(min(\($0),ih)/2)*2'" } ?? MediaConverter.evenSize
-        var video = ["-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p"]
-        if let megabytes = options.targetMegabytes {
-            let duration = try await FFmpeg.duration(of: url)
-            let audioKbps = options.removeAudio ? 0 : 128
-            let kbps = max(100, Int(megabytes * 8 * 1000 / duration) - audioKbps)
-            video += ["-b:v", "\(kbps)k", "-maxrate", "\(kbps * 6 / 5)k", "-bufsize", "\(kbps * 2)k"]
-        } else {
-            video += ["-crf", String(options.strength.crf)]
-        }
+        let video = ["-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p"]
         let audio = options.removeAudio ? ["-an"] : ["-c:a", "aac", "-b:a", "128k"]
-        try await FFmpeg.run(["-i", url.path, "-vf", scale] + video + audio + ["-movflags", "+faststart", out.path])
+        func encode(_ rate: [String]) async throws {
+            try await FFmpeg.encode(["-i", url.path, "-vf", scale] + video + rate + audio + ["-movflags", "+faststart"], to: out)
+        }
+        guard let megabytes = options.targetMegabytes else {
+            try await encode(["-crf", String(options.strength.crf)])
+            return out
+        }
+        // Single-pass bitrate control drifts, so aim under the target and correct once if it still lands over.
+        let duration = try await FFmpeg.duration(of: url)
+        let audioKbps = options.removeAudio ? 0 : 128
+        let targetBytes = megabytes * 1_000_000
+        var kbps = max(100, Int(targetBytes * 0.92 * 8 / 1000 / duration) - audioKbps)
+        for attempt in 0..<2 {
+            try await encode(["-b:v", "\(kbps)k", "-maxrate", "\(kbps * 6 / 5)k", "-bufsize", "\(kbps * 2)k"])
+            let size = Double((try? out.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+            guard attempt == 0, size > targetBytes, kbps > 100 else { break }
+            kbps = max(100, Int(Double(kbps) * targetBytes / size * 0.9))
+        }
         return out
     }
 
@@ -61,8 +70,8 @@ enum VideoTools {
         let format = format(for: url)
         let out = Output.url(for: url, ext: format.rawValue, suffix: suffix)
         let filter = [.webm, .avi, .wmv].contains(format) ? [] : ["-vf", MediaConverter.evenSize]
-        try await FFmpeg.run(["-ss", "\(range.lowerBound)", "-i", url.path, "-t", "\(range.upperBound - range.lowerBound)"]
-                             + filter + encoder(format) + [out.path])
+        try await FFmpeg.encode(["-ss", FFmpeg.time(range.lowerBound), "-i", url.path, "-t", FFmpeg.time(range.upperBound - range.lowerBound)]
+                             + filter + encoder(format), to: out)
         return out
     }
 
@@ -71,7 +80,7 @@ enum VideoTools {
         let format = format(for: url)
         let out = Output.url(for: url, ext: format.rawValue, suffix: "cropped")
         let filter = "crop=iw*\(rect.width):ih*\(rect.height):iw*\(rect.minX):ih*\(rect.minY),\(MediaConverter.evenSize)"
-        try await FFmpeg.run(["-i", url.path, "-vf", filter] + encoder(format) + [out.path])
+        try await FFmpeg.encode(["-i", url.path, "-vf", filter] + encoder(format), to: out)
         return out
     }
 
@@ -95,7 +104,7 @@ enum VideoTools {
         graph.append("[joined]\(MediaConverter.evenSize)[v]")
         var arguments = ["-i", url.path, "-filter_complex", graph.joined(separator: ";"), "-map", "[v]"]
         if audio { arguments += ["-map", "[a]"] }
-        try await FFmpeg.run(arguments + encoder(format) + [out.path])
+        try await FFmpeg.encode(arguments + encoder(format), to: out)
         return out
     }
 
@@ -109,10 +118,10 @@ enum VideoTools {
         let out = Output.url(for: url, ext: "gif")
         var arguments: [String] = []
         if let range = options.range {
-            arguments += ["-ss", "\(range.lowerBound)", "-t", "\(range.upperBound - range.lowerBound)"]
+            arguments += ["-ss", FFmpeg.time(range.lowerBound), "-t", FFmpeg.time(range.upperBound - range.lowerBound)]
         }
         let filter = "fps=\(options.fps),scale='min(\(options.width),iw)':-2:flags=lanczos,split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4"
-        try await FFmpeg.run(arguments + ["-i", url.path, "-vf", filter, "-loop", "0", out.path])
+        try await FFmpeg.encode(arguments + ["-i", url.path, "-vf", filter, "-loop", "0"], to: out)
         return out
     }
 
@@ -145,7 +154,7 @@ enum VideoTools {
         let graph = await FFmpeg.hasAudio(url)
             ? ["-filter_complex", "\(video);[0:a]\(atempo(factor))[a]", "-map", "[v]", "-map", "[a]"]
             : ["-filter_complex", video, "-map", "[v]"]
-        try await FFmpeg.run(["-i", url.path] + graph + encoder(format) + [out.path])
+        try await FFmpeg.encode(["-i", url.path] + graph + encoder(format), to: out)
         return out
     }
 
@@ -182,8 +191,8 @@ enum VideoTools {
             label = "r\(i)"
         }
         graph.append("[\(label)]\(MediaConverter.evenSize)[v]")
-        try await FFmpeg.run(["-i", url.path, "-filter_complex", graph.joined(separator: ";"), "-map", "[v]", "-map", "0:a?"]
-                             + encoder(format) + [out.path])
+        try await FFmpeg.encode(["-i", url.path, "-filter_complex", graph.joined(separator: ";"), "-map", "[v]", "-map", "0:a?"]
+                             + encoder(format), to: out)
         return out
     }
 
@@ -194,12 +203,14 @@ enum VideoTools {
         let folder: URL? = times.count > 1 ? Output.url(for: url, ext: nil, suffix: "snapshots") : nil
         if let folder { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
         let base = Output.baseName(url)
+        // A seek to or past the last frame decodes nothing, so stay just inside the end.
+        let lastFrame = max(0, try await FFmpeg.duration(of: url) - 0.05)
         var outputs: [URL] = []
-        for time in times.sorted() {
+        for time in times.map({ min($0, lastFrame) }).sorted() {
             let stamp = String(format: "%02dm%05.2fs", Int(time) / 60, time.truncatingRemainder(dividingBy: 60))
             let out = folder.map { $0.appendingPathComponent("\(base) \(stamp).\(format.rawValue)") }
                 ?? Output.url(for: url, ext: format.rawValue, suffix: "snapshot")
-            try await FFmpeg.run(["-ss", "\(time)", "-i", url.path, "-frames:v", "1", "-update", "1", out.path])
+            try await FFmpeg.encode(["-ss", FFmpeg.time(time), "-i", url.path, "-frames:v", "1", "-update", "1"], to: out)
             outputs.append(out)
         }
         return folder.map { [$0] } ?? outputs
@@ -212,16 +223,21 @@ enum VideoTools {
         let format = format(for: urls[0])
         let out = Output.url(for: urls[0], ext: format.rawValue, suffix: "merged")
         let size = try await dimensions(of: urls[0])
-        var withAudio = true
-        for url in urls where !(await FFmpeg.hasAudio(url)) { withAudio = false }
+        var hasAudio: [Bool] = []
+        for url in urls { hasAudio.append(await FFmpeg.hasAudio(url)) }
+        let withAudio = hasAudio.contains(true)
 
         var graph: [String] = []
         var inputs = ""
-        for i in urls.indices {
+        for (i, url) in urls.enumerated() {
             graph.append("[\(i):v]scale=\(size.w):\(size.h):force_original_aspect_ratio=decrease,pad=\(size.w):\(size.h):(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v\(i)]")
             inputs += "[v\(i)]"
             if withAudio {
-                graph.append("[\(i):a]aresample=48000,aformat=channel_layouts=stereo[a\(i)]")
+                // Clips without sound get silence for their length, so the others keep theirs.
+                let source = hasAudio[i]
+                    ? "[\(i):a]aresample=48000,"
+                    : "anullsrc=r=48000:cl=stereo,atrim=duration=\(try await FFmpeg.duration(of: url)),"
+                graph.append("\(source)aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a\(i)]")
                 inputs += "[a\(i)]"
             }
         }
@@ -229,7 +245,7 @@ enum VideoTools {
         var arguments: [String] = urls.flatMap { ["-i", $0.path] }
         arguments += ["-filter_complex", graph.joined(separator: ";"), "-map", "[v]"]
         if withAudio { arguments += ["-map", "[a]"] }
-        try await FFmpeg.run(arguments + encoder(format) + [out.path])
+        try await FFmpeg.encode(arguments + encoder(format), to: out)
         return out
     }
 
@@ -244,7 +260,7 @@ enum VideoTools {
 
     static func removeAudio(_ url: URL) async throws -> URL {
         let out = Output.url(for: url, ext: url.pathExtension, suffix: "muted")
-        try await FFmpeg.run(["-i", url.path, "-c:v", "copy", "-an", out.path])
+        try await FFmpeg.encode(["-i", url.path, "-c:v", "copy", "-an"], to: out)
         return out
     }
 }
@@ -257,7 +273,7 @@ enum AudioTools {
 
     private static func filter(_ url: URL, _ filter: String, suffix: String) async throws -> URL {
         let (out, format) = output(for: url, suffix: suffix)
-        try await FFmpeg.run(["-i", url.path, "-vn", "-af", filter] + format.codecArguments + [out.path])
+        try await FFmpeg.encode(["-i", url.path, "-vn", "-af", filter] + format.codecArguments, to: out)
         return out
     }
 
@@ -275,7 +291,7 @@ enum AudioTools {
         default: "aac"
         }
         let channels = mono ? ["-ac", "1"] : format == .ogg ? ["-ac", "2"] : []
-        try await FFmpeg.run(["-i", url.path, "-vn", "-c:a", codec, "-b:a", "\(kbps)k", "-strict", "-2"] + channels + [out.path])
+        try await FFmpeg.encode(["-i", url.path, "-vn", "-c:a", codec, "-b:a", "\(kbps)k", "-strict", "-2"] + channels, to: out)
         return out
     }
 
@@ -283,8 +299,8 @@ enum AudioTools {
 
     static func trim(_ url: URL, _ range: ClosedRange<Double>) async throws -> URL {
         let (out, format) = output(for: url, suffix: "trimmed")
-        try await FFmpeg.run(["-ss", "\(range.lowerBound)", "-i", url.path, "-t", "\(range.upperBound - range.lowerBound)", "-vn"]
-                             + format.codecArguments + [out.path])
+        try await FFmpeg.encode(["-ss", FFmpeg.time(range.lowerBound), "-i", url.path, "-t", FFmpeg.time(range.upperBound - range.lowerBound), "-vn"]
+                             + format.codecArguments, to: out)
         return out
     }
 
@@ -340,7 +356,7 @@ enum AudioTools {
         let graph = beep
             ? "[0:a]volume=0:enable='\(when)'[m];sine=frequency=1000:sample_rate=48000,volume=0.25,volume=0:enable='not(\(when))'[s];[m][s]amix=inputs=2:duration=first:normalize=0[a]"
             : "[0:a]volume=0:enable='\(when)'[a]"
-        try await FFmpeg.run(["-i", url.path, "-filter_complex", graph, "-map", "[a]"] + format.codecArguments + [out.path])
+        try await FFmpeg.encode(["-i", url.path, "-filter_complex", graph, "-map", "[a]"] + format.codecArguments, to: out)
         return out
     }
 
@@ -374,8 +390,8 @@ enum AudioTools {
         let background = options.backgroundImage.map { ["-loop", "1", "-framerate", "30", "-i", $0.path] }
             ?? ["-f", "lavfi", "-i", "color=c=\(hex(options.background)):s=\(size):r=30"]
         let graph = "[0:a]\(visual),format=rgba,colorkey=black:0.01:0[w];[1:v]scale=\(options.width):\(options.height):force_original_aspect_ratio=increase,crop=\(options.width):\(options.height)[bg];[bg][w]overlay=shortest=1,format=yuv420p[v]"
-        try await FFmpeg.run(["-i", url.path] + background + ["-filter_complex", graph, "-map", "[v]", "-map", "0:a",
-                                                              "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-c:a", "aac", "-b:a", "192k", "-shortest", out.path])
+        try await FFmpeg.encode(["-i", url.path] + background + ["-filter_complex", graph, "-map", "[v]", "-map", "0:a",
+                                                              "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-c:a", "aac", "-b:a", "192k", "-shortest"], to: out)
         return out
     }
 
@@ -391,8 +407,8 @@ enum AudioTools {
         let (out, format) = output(for: urls[0], suffix: "merged")
         let inputs = urls.indices.map { "[\($0):a]aresample=48000,aformat=channel_layouts=stereo[a\($0)]" }.joined(separator: ";")
         let labels = urls.indices.map { "[a\($0)]" }.joined()
-        try await FFmpeg.run(urls.flatMap { ["-i", $0.path] } + ["-filter_complex", "\(inputs);\(labels)concat=n=\(urls.count):v=0:a=1[a]", "-map", "[a]"]
-                             + format.codecArguments + [out.path])
+        try await FFmpeg.encode(urls.flatMap { ["-i", $0.path] } + ["-filter_complex", "\(inputs);\(labels)concat=n=\(urls.count):v=0:a=1[a]", "-map", "[a]"]
+                             + format.codecArguments, to: out)
         return out
     }
 }

@@ -34,6 +34,14 @@ enum IWork {
         guard isInstalled(app) else {
             throw SwitchelError("This needs \(app.rawValue), which is free on the Mac App Store.")
         }
+        // The iWork apps are sandboxed and can't open paths in Downloads, Desktop or Documents
+        // handed over by another app, so they work on copies in a temporary folder.
+        let scratch = try Output.temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let inCopy = scratch.appendingPathComponent(input.lastPathComponent)
+        try FileManager.default.copyItem(at: input, to: inCopy)
+        let outCopy = scratch.appendingPathComponent("export", isDirectory: true).appendingPathComponent(output.lastPathComponent)
+        try FileManager.default.createDirectory(at: outCopy.deletingLastPathComponent(), withIntermediateDirectories: true)
         let script = """
         on run argv
             set inFile to POSIX file (item 1 of argv)
@@ -50,7 +58,11 @@ enum IWork {
         end run
         """
         do {
-            try await Shell.run("/usr/bin/osascript", ["-e", script, input.path, output.path])
+            try await Shell.run("/usr/bin/osascript", ["-e", script, inCopy.path, outCopy.path])
+            guard FileManager.default.fileExists(atPath: outCopy.path) else {
+                throw SwitchelError("\(app.rawValue) didn't export \(output.lastPathComponent)")
+            }
+            try FileManager.default.moveItem(at: outCopy, to: output)
         } catch {
             if "\(error.localizedDescription)".contains("-1743") {
                 throw SwitchelError("Allow Switchel to control \(app.rawValue) in System Settings › Privacy & Security › Automation.")

@@ -36,8 +36,21 @@ enum ImageTools {
                 try await Shell.run(cwebp, ["-quiet", "-size", String(limit), png.path, "-o", out.path])
                 return out
             }
+            // Lossless formats have no quality to search, so only the pixel size can come down.
+            guard format.isLossy else {
+                for _ in 0..<12 {
+                    let data = try ImageConverter.encode(image, type: format.type, quality: 1)
+                    if data.count <= limit {
+                        try data.write(to: out)
+                        return out
+                    }
+                    // Size tracks pixel count, so scale both sides by the square root, a little under.
+                    image = try resized(image, scale: min(0.9, (Double(limit) / Double(data.count)).squareRoot() * 0.95))
+                }
+                throw SwitchelError("Couldn't get \(url.lastPathComponent) under \(ByteCountFormatter.string(fromByteCount: Int64(limit), countStyle: .file)) as \(format.rawValue.uppercased())")
+            }
             // Search quality first; if even the lowest is too big, shrink and search again.
-            let type = format.isLossy ? format.type : UTType.jpeg
+            let type = format.type
             for _ in 0..<6 {
                 var low = 0.05, high = 0.95
                 var best: Data?
@@ -588,7 +601,7 @@ enum ImageTools {
 
     /// One PDF page per image, named after the first file.
     static func combineIntoPDF(_ urls: [URL]) throws -> URL {
-        let images = try urls.map { try ImageConverter.load($0) }
+        let images = try urls.flatMap { try ImageConverter.loadPages($0) }
         let out = Output.url(for: urls[0], ext: "pdf", suffix: urls.count > 1 ? "combined" : nil)
         try ImageConverter.writePDF(images, to: out)
         return out

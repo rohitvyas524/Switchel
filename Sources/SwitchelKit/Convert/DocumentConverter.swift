@@ -70,10 +70,9 @@ enum DocumentConverter {
     static func read(_ url: URL) async throws -> NSAttributedString {
         switch Output.normalizedExtension(url) {
         case "md":
-            return try html(Data(Markdown.html(try String(contentsOf: url)).utf8))
+            return try html(Data(Markdown.html(try String(readingText: url)).utf8))
         case "txt":
-            var encoding = String.Encoding.utf8
-            let string = try String(contentsOf: url, usedEncoding: &encoding)
+            let string = try String(readingText: url)
             return NSAttributedString(string: string, attributes: [.font: NSFont.systemFont(ofSize: 13)])
         case "epub":
             let (chapters, folder) = try await Packages.epubChapters(url)

@@ -68,6 +68,21 @@ enum FFmpeg {
         try await Shell.run(ffmpeg, ["-hide_banner", "-loglevel", "error", "-nostdin", "-y"] + arguments)
     }
 
+    /// Runs with `out` as the output, and fails if ffmpeg exited cleanly without writing it.
+    static func encode(_ arguments: [String], to out: URL) async throws {
+        try await run(arguments + [out.path])
+        let size = (try? out.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        guard size > 0 else {
+            try? FileManager.default.removeItem(at: out)
+            throw SwitchelError("ffmpeg didn't write \(out.lastPathComponent)")
+        }
+    }
+
+    /// Seconds for `-ss` and `-t`, which reject the scientific notation Swift uses for tiny values.
+    static func time(_ seconds: Double) -> String {
+        String(format: "%.6f", max(0, seconds))
+    }
+
     /// Seconds, from AVFoundation when it can read the file, otherwise ffprobe.
     static func duration(of url: URL) async throws -> Double {
         if let seconds = try? await AVURLAsset(url: url).load(.duration).seconds, seconds.isFinite, seconds > 0 {
@@ -103,8 +118,10 @@ enum Zip {
         if let storedFirst {
             try await Shell.run("/usr/bin/zip", ["-X0q", archive.path, storedFirst], in: folder)
         }
+        // "./" keeps a name starting with "-" from being read as an option; zip drops it from the entry.
         let items = try FileManager.default.contentsOfDirectory(atPath: folder.path)
             .filter { $0 != storedFirst && $0 != ".DS_Store" }
+            .map { "./\($0)" }
         try await Shell.run("/usr/bin/zip", ["-Xrq9", archive.path] + items, in: folder)
     }
 

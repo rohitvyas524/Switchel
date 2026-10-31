@@ -33,8 +33,8 @@ enum SpreadsheetConverter {
 
     static func read(_ url: URL) async throws -> Table {
         switch Output.normalizedExtension(url) {
-        case "csv": return CSV.parse(try String(contentsOf: url), separator: ",")
-        case "tsv": return CSV.parse(try String(contentsOf: url), separator: "\t")
+        case "csv": return CSV.parse(try String(readingText: url), separator: ",")
+        case "tsv": return CSV.parse(try String(readingText: url), separator: "\t")
         case "xlsx": return try await Packages.readXLSX(url)
         case "ods": return try await Packages.readODS(url)
         default:
@@ -151,7 +151,7 @@ enum SubtitleConverter {
     }
 
     static func convert(_ url: URL, to format: SubtitleFormat) throws -> URL {
-        let cues = parse(try String(contentsOf: url))
+        let cues = parse(try String(readingText: url))
         let out = Output.url(for: url, ext: format.rawValue)
         try write(cues, as: format).write(to: out, atomically: true, encoding: .utf8)
         return out
@@ -215,9 +215,40 @@ enum ArchiveConverter {
             try await Shell.run("/usr/bin/tar", ["-xf", url.path, "-C", folder.path])
         } catch {
             try? FileManager.default.removeItem(at: folder)
-            throw error
+            // A plain "notes.txt.gz" compresses one file rather than a tarball, so tar can't read it.
+            guard isCompressedFile(url) else { throw error }
+            let out = Output.url(for: url, ext: nil)
+            try await decompress(url, to: out)
+            return out
         }
         return folder
+    }
+
+    /// Single-file compression that tar only reads when there's a tarball inside.
+    static func isCompressedFile(_ url: URL) -> Bool {
+        ["gz", "bz2", "xz"].contains(url.pathExtension.lowercased())
+    }
+
+    static func decompress(_ url: URL, to out: URL) async throws {
+        do {
+            switch url.pathExtension.lowercased() {
+            case "xz": try await Shell.run("/usr/bin/compression_tool", ["-decode", "-a", "lzma", "-i", url.path, "-o", out.path])
+            case "bz2": try await Shell.run("/bin/sh", ["-c", "/usr/bin/bzcat -- \"$1\" > \"$2\"", "sh", url.path, out.path])
+            default: try await Shell.run("/bin/sh", ["-c", "/usr/bin/gzcat -- \"$1\" > \"$2\"", "sh", url.path, out.path])
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: out)
+            throw error
+        }
+    }
+
+    /// Unpacks an archive, or a single compressed file, into `folder`.
+    static func unpack(_ url: URL, into folder: URL) async throws {
+        do {
+            try await Shell.run("/usr/bin/tar", ["-xf", url.path, "-C", folder.path])
+        } catch where isCompressedFile(url) {
+            try await decompress(url, to: folder.appendingPathComponent(Output.baseName(url)))
+        }
     }
 
     /// Archives a folder, or repacks another archive.
@@ -229,17 +260,18 @@ enum ArchiveConverter {
         }
         let scratch = try Output.temporaryFolder()
         defer { try? FileManager.default.removeItem(at: scratch) }
-        try await Shell.run("/usr/bin/tar", ["-xf", url.path, "-C", scratch.path])
+        try await unpack(url, into: scratch)
         let items = try FileManager.default.contentsOfDirectory(atPath: scratch.path).filter { $0 != ".DS_Store" }
         try await pack(items, in: scratch, to: out, as: format)
         return out
     }
 
     static func pack(_ items: [String], in folder: URL, to out: URL, as format: ArchiveFormat) async throws {
+        // Names starting with "-" mustn't be read as options: zip takes "./name", tar takes "--".
         switch format {
-        case .zip: try await Shell.run("/usr/bin/zip", ["-rqy", out.path] + items, in: folder)
-        case .tar: try await Shell.run("/usr/bin/tar", ["-cf", out.path, "-C", folder.path] + items)
-        case .gz: try await Shell.run("/usr/bin/tar", ["-czf", out.path, "-C", folder.path] + items)
+        case .zip: try await Shell.run("/usr/bin/zip", ["-rqy", out.path] + items.map { "./\($0)" }, in: folder)
+        case .tar: try await Shell.run("/usr/bin/tar", ["-cf", out.path, "-C", folder.path, "--"] + items)
+        case .gz: try await Shell.run("/usr/bin/tar", ["-czf", out.path, "-C", folder.path, "--"] + items)
         }
     }
 }

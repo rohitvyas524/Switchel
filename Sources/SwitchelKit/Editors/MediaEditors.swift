@@ -479,7 +479,7 @@ private struct VideoRedactView: View {
         guard let folder = try? Output.temporaryFolder() else { return nil }
         defer { try? FileManager.default.removeItem(at: folder) }
         let file = folder.appendingPathComponent("frame.png")
-        try? await FFmpeg.run(["-ss", "\(time)", "-i", url.path, "-frames:v", "1", "-vf", "scale='min(1280,iw)':-2", file.path])
+        try? await FFmpeg.run(["-ss", FFmpeg.time(time), "-i", url.path, "-frames:v", "1", "-vf", "scale='min(1280,iw)':-2", file.path])
         return NSImage(contentsOf: file)
     }
 

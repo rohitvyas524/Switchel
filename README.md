@@ -49,7 +49,9 @@ You can change the keys, turn wheels off, and set a global shortcut that opens t
 | Spreadsheets (XLSX, ODS, CSV, TSV; XLS, Numbers in) | XLSX, ODS, CSV, TSV, PDF |
 | Slides (PPTX, PPT, Keynote) | PDF, JPG, PNG |
 | Subtitles (SRT, VTT) | SRT, VTT, TXT |
-| Archives (ZIP, TAR, GZIP; RAR, 7z in) and folders | ZIP, TAR, TAR.GZ |
+| Archives (ZIP, TAR, GZIP; RAR, 7z, BZIP2, XZ in) and folders | ZIP, TAR, TAR.GZ |
+
+Image conversions keep the photo's details (capture date, camera, location), except to WebP; use **Metadata** to strip them. Multipage TIFFs become one PDF page per page, and animated GIFs convert using their first frame. Photos turned into PDFs are fitted onto A4 or US Letter pages.
 
 ## Tools
 
@@ -76,7 +78,7 @@ Switchel asks once for Automation permission the first time it uses Pages, Keyno
 Requires macOS 14+ on Apple silicon and Xcode 15+.
 
 ```sh
-swift test                  # 42 tests over every converter and tool engine (media tests need ffmpeg)
+swift test                  # 51 tests over every converter and tool engine (media tests need ffmpeg)
 ./scripts/build-app.sh      # → build/Switchel.app and build/Switchel.zip
 open build/Switchel.app
 ```

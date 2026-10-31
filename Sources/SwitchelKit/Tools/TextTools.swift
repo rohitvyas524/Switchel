@@ -157,7 +157,7 @@ enum TextTools {
     }
 
     static func cleanUp(_ url: URL, _ options: Cleanup) async throws -> URL {
-        let original = try String(contentsOf: url)
+        let original = try String(readingText: url)
         let out = Output.url(for: url, ext: url.pathExtension, suffix: "clean")
         try clean(original, options).write(to: out, atomically: true, encoding: .utf8)
         return out
@@ -171,7 +171,7 @@ enum TextTools {
         if sorted.allSatisfy(isPlain) {
             let ext = sorted[0].pathExtension
             let out = Output.url(for: sorted[0], ext: ext, suffix: "merged")
-            let parts = try sorted.map { try String(contentsOf: $0).trimmingCharacters(in: .newlines) }
+            let parts = try sorted.map { try String(readingText: $0).trimmingCharacters(in: .newlines) }
             try (parts.joined(separator: "\n\n") + "\n").write(to: out, atomically: true, encoding: .utf8)
             return out
         }
@@ -190,8 +190,7 @@ enum TextTools {
     /// Reads, edits and writes a copy in the same format.
     private static func rewrite(_ url: URL, suffix: String, _ edit: (NSMutableAttributedString) throws -> Void) async throws -> URL {
         if isPlain(url) {
-            var encoding = String.Encoding.utf8
-            let text = NSMutableAttributedString(string: try String(contentsOf: url, usedEncoding: &encoding))
+            let text = NSMutableAttributedString(string: try String(readingText: url))
             try edit(text)
             let out = Output.url(for: url, ext: url.pathExtension, suffix: suffix)
             try text.string.write(to: out, atomically: true, encoding: .utf8)
@@ -210,7 +209,7 @@ enum TextTools {
 enum SubtitleTools {
     /// Moves every cue by `seconds` (negative is earlier), never before zero.
     static func shift(_ url: URL, by seconds: Double) throws -> URL {
-        let cues = SubtitleConverter.parse(try String(contentsOf: url)).map { cue in
+        let cues = SubtitleConverter.parse(try String(readingText: url)).map { cue in
             SubtitleConverter.Cue(start: max(cue.start + seconds, 0), end: max(cue.end + seconds, 0), text: cue.text)
         }
         let format = SubtitleFormat(rawValue: Output.normalizedExtension(url)) ?? .srt

@@ -58,7 +58,7 @@ enum MediaConverter {
             }
         }
         let out = Output.url(for: url, ext: format.rawValue)
-        try await FFmpeg.run(["-i", url.path] + videoArguments(format) + [out.path])
+        try await FFmpeg.encode(["-i", url.path] + videoArguments(format), to: out)
         return out
     }
 
@@ -71,7 +71,7 @@ enum MediaConverter {
             }
         }
         let out = Output.url(for: url, ext: format.rawValue)
-        try await FFmpeg.run(["-i", url.path, "-vn"] + format.codecArguments + [out.path])
+        try await FFmpeg.encode(["-i", url.path, "-vn"] + format.codecArguments, to: out)
         return out
     }
 
