@@ -37,6 +37,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !Settings.shared.hasCompletedWelcome { showWelcome() }
     }
 
+    /// Opening the app again from Launchpad or Finder while it's running shows Settings.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showSettings()
+        return false
+    }
+
     private func run(_ item: WheelItem, on urls: [URL]) {
         if !item.interactive { Toast.shared.show("\(item.title)…", sticky: true) }
         Task {

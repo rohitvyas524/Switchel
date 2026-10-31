@@ -1,6 +1,19 @@
 # Switchel
 
+![Switchel](docs/images/hero.jpg)
+
 A menu-bar file converter and toolbox for macOS. Drag files anywhere, hold a key, and drop on a slice of the wheel. Everything runs locally. Results are saved next to the original (or in a folder you choose), and the original is never changed.
+
+## Download
+
+**[⬇ Download Switchel for macOS](https://github.com/rohitvyas524/Switchel/releases/latest/download/Switchel.zip)** (macOS 14+, Apple silicon) · [All releases](https://github.com/rohitvyas524/Switchel/releases)
+
+1. Unzip and drag **Switchel.app** to your Applications folder.
+2. The app isn't notarized, so macOS blocks it the first time you open it. Go to **System Settings › Privacy & Security**, scroll down, and click **Open Anyway**. On macOS 14 you can instead right-click the app and choose **Open**. Or run `xattr -dr com.apple.quarantine /Applications/Switchel.app` in Terminal.
+
+## How it works
+
+![The Convert wheel](docs/images/convert-wheel.jpg)
 
 | Default key | Wheel | What's on it |
 |---|---|---|
@@ -9,6 +22,8 @@ A menu-bar file converter and toolbox for macOS. Drag files anywhere, hold a key
 | ⌃ Control | Actions | AirDrop, Float, Copy, Move, Copy Path, Terminal; works on folders and mixed selections |
 
 You can change the keys, turn wheels off, and set a global shortcut that opens the wheel for the current Finder selection (← → to choose, Tab to switch wheels, Return to apply). These are in the first-launch wizard and in **Settings**.
+
+![Convert, Tools and Actions wheels](docs/images/three-wheels.jpg)
 
 ## Conversions
 
@@ -50,9 +65,11 @@ Requires macOS 14+ on Apple silicon and Xcode 15+.
 
 ```sh
 swift test                  # 26 tests over every converter and tool engine (media tests need ffmpeg)
-./scripts/build-app.sh      # → build/Switchel.app
+./scripts/build-app.sh      # → build/Switchel.app and build/Switchel.zip
 open build/Switchel.app
 ```
+
+To publish a release, attach `build/Switchel.zip` to a new GitHub release. Keep the name `Switchel.zip` so the download link above keeps working. `swift scripts/make-icon.swift` regenerates `Resources/AppIcon.icns`.
 
 ## Layout
 
