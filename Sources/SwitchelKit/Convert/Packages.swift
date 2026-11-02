@@ -228,12 +228,10 @@ enum Packages {
             }
         }
 
-        let sheets = folder.appendingPathComponent("xl/worksheets")
-        let names = (try? FileManager.default.contentsOfDirectory(atPath: sheets.path)) ?? []
-        guard let first = names.filter({ $0.hasSuffix(".xml") }).sorted(by: { $0.localizedStandardCompare($1) == .orderedAscending }).first else {
+        guard let first = firstWorksheet(in: folder) else {
             throw SwitchelError("\(url.lastPathComponent) has no sheets")
         }
-        let sheet = try XMLDocument(contentsOf: sheets.appendingPathComponent(first))
+        let sheet = try XMLDocument(contentsOf: first)
 
         var table: Table = []
         for rowNode in try sheet.nodes(forXPath: "//*[local-name()='row']") {
@@ -262,6 +260,39 @@ enum Packages {
             table.append(cells)
         }
         return table
+    }
+
+    /// The leftmost visible tab. File names don't follow tab order once tabs have been reordered,
+    /// so this reads the order from the workbook, using file names only if it's unreadable.
+    private static func firstWorksheet(in folder: URL) -> URL? {
+        func elements(_ path: String, _ xpath: String) -> [XMLElement] {
+            let document = try? XMLDocument(contentsOf: folder.appendingPathComponent(path))
+            return ((try? document?.nodes(forXPath: xpath)) ?? []).compactMap { $0 as? XMLElement }
+        }
+        var targets: [String: String] = [:]
+        for relationship in elements("xl/_rels/workbook.xml.rels", "//*[local-name()='Relationship']")
+        where relationship.attribute(forName: "Type")?.stringValue?.hasSuffix("/worksheet") == true {
+            if let id = relationship.attribute(forName: "Id")?.stringValue, let target = relationship.attribute(forName: "Target")?.stringValue {
+                targets[id] = target
+            }
+        }
+        let root = folder.standardized.path
+        func file(for sheet: XMLElement) -> URL? {
+            guard let id = sheet.attributes?.first(where: { $0.localName == "id" })?.stringValue, let target = targets[id] else { return nil }
+            let path = target.hasPrefix("/") ? String(target.dropFirst()) : "xl/\(target)"
+            let url = folder.appendingPathComponent(path).standardized
+            // A crafted file mustn't point outside its own package.
+            return url.path.hasPrefix(root + "/") && FileManager.default.fileExists(atPath: url.path) ? url : nil
+        }
+        let sheets = elements("xl/workbook.xml", "//*[local-name()='sheets']/*[local-name()='sheet']")
+        let visible = sheets.filter { ["visible", nil].contains($0.attribute(forName: "state")?.stringValue) }
+        if let first = (visible + sheets).lazy.compactMap(file).first { return first }
+
+        let folderOfSheets = folder.appendingPathComponent("xl/worksheets")
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: folderOfSheets.path)) ?? []
+        return names.filter { $0.hasSuffix(".xml") }
+            .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+            .first.map { folderOfSheets.appendingPathComponent($0) }
     }
 
     static func columnName(_ index: Int) -> String {
@@ -322,22 +353,41 @@ enum Packages {
         let content = try XMLDocument(contentsOf: folder.appendingPathComponent("content.xml"))
         guard let sheet = try content.nodes(forXPath: "//*[local-name()='table']").first else { return [] }
 
+        // Spreadsheets pad their ends with one blank cell or row repeated enormously, so blanks only
+        // count once something follows them. The limits stop a crafted file exhausting memory.
+        let maxColumns = 16_384, maxRows = 1_048_576
+        func repeats(_ element: XMLElement, _ attribute: String, limit: Int) -> Int {
+            min(max(Int(element.attribute(forName: attribute)?.stringValue ?? "") ?? 1, 1), limit)
+        }
         var table: Table = []
+        var blankRows = 0
         for rowNode in try sheet.nodes(forXPath: ".//*[local-name()='table-row']") {
             guard let row = rowNode as? XMLElement else { continue }
             var cells: [String] = []
+            var blankCells = 0
             for cellNode in try row.nodes(forXPath: "./*[local-name()='table-cell' or local-name()='covered-table-cell']") {
                 guard let cell = cellNode as? XMLElement else { continue }
                 let text = try cell.nodes(forXPath: "./*[local-name()='p']").compactMap(\.stringValue).joined(separator: "\n")
-                // Empty trailing cells are stored as one cell repeated hundreds of times.
-                let repeats = min(Int(cell.attribute(forName: "table:number-columns-repeated")?.stringValue ?? "") ?? 1, text.isEmpty ? 1 : 1000)
-                cells += Array(repeating: text, count: repeats)
+                let count = repeats(cell, "table:number-columns-repeated", limit: maxColumns)
+                if text.isEmpty {
+                    blankCells += count
+                } else {
+                    let padding = min(blankCells, maxColumns - cells.count)
+                    cells += Array(repeating: "", count: padding)
+                    cells += Array(repeating: text, count: min(count, maxColumns - cells.count))
+                    blankCells = 0
+                }
             }
-            while cells.last == "" { cells.removeLast() }
-            let repeats = Int(row.attribute(forName: "table:number-rows-repeated")?.stringValue ?? "") ?? 1
-            table += Array(repeating: cells, count: cells.isEmpty ? 1 : min(repeats, 1000))
+            let count = repeats(row, "table:number-rows-repeated", limit: maxRows)
+            if cells.isEmpty {
+                blankRows += count
+            } else {
+                let padding = min(blankRows, maxRows - table.count)
+                table += Array(repeating: [], count: padding)
+                table += Array(repeating: cells, count: min(count, maxRows - table.count))
+                blankRows = 0
+            }
         }
-        while table.last?.isEmpty == true { table.removeLast() }
         return table
     }
 

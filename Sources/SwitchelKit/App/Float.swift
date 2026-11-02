@@ -44,11 +44,19 @@ final class FloatController {
     }
 
     private func resize(to size: NSSize) {
-        // Keep the top edge where it is.
-        var frame = panel.frame
-        frame.origin.y += frame.height - size.height
-        frame.size = size
-        panel.setFrame(frame, display: true, animate: true)
+        let screen = panel.screen?.visibleFrame ?? NSScreen.main?.visibleFrame
+        panel.setFrame(Self.fitted(panel.frame, to: size, on: screen), display: true, animate: true)
+    }
+
+    /// Keeps the top edge where it is, unless that would run off the bottom of the screen.
+    /// Taller than the screen is capped; the list scrolls instead.
+    static func fitted(_ frame: NSRect, to size: NSSize, on screen: NSRect?) -> NSRect {
+        var result = frame
+        result.size = size
+        if let screen { result.size.height = min(size.height, screen.height - 20) }
+        result.origin.y = frame.maxY - result.height
+        if let screen, result.minY < screen.minY { result.origin.y = screen.minY }
+        return result
     }
 
     func close() {
@@ -67,6 +75,7 @@ final class FloatView: NSView, NSDraggingSource {
     private var urls: [URL] = []
     private var thumbnails: [URL: NSImage] = [:]
     private var expanded = false
+    private var scrollOffset: CGFloat = 0
     private var draggedRow: Int?
     private var mouseDownPoint: NSPoint?
     private var isDropTarget = false { didSet { needsDisplay = true } }
@@ -144,6 +153,19 @@ final class FloatView: NSView, NSDraggingSource {
     override func layout() {
         super.layout()
         layoutButtons()
+        scroll(by: 0)
+    }
+
+    private var maxScroll: CGFloat { max(0, header + CGFloat(urls.count) * rowHeight + 10 - bounds.height) }
+
+    func scroll(by delta: CGFloat) {
+        scrollOffset = min(max(scrollOffset + delta, 0), maxScroll)
+        needsDisplay = true
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard expanded else { return super.scrollWheel(with: event) }
+        scroll(by: -event.scrollingDeltaY * (event.hasPreciseScrollingDeltas ? 1 : rowHeight / 2))
     }
 
     private func layoutButtons() {
@@ -180,8 +202,20 @@ final class FloatView: NSView, NSDraggingSource {
     }
 
     private func drawList() {
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        let list = NSRect(x: 0, y: header, width: bounds.width, height: bounds.height - header)
+        NSBezierPath(rect: list).setClip()
+        if maxScroll > 0 {
+            // A slim bar, so it's clear there's more to scroll to.
+            let height = max(24, list.height * list.height / (list.height + maxScroll))
+            let y = list.minY + (list.height - height) * scrollOffset / maxScroll
+            NSColor.tertiaryLabelColor.setFill()
+            NSBezierPath(roundedRect: NSRect(x: bounds.width - 6, y: y, width: 3, height: height), xRadius: 1.5, yRadius: 1.5).fill()
+        }
         for (i, url) in urls.enumerated() {
             let row = rowRect(i)
+            guard row.intersects(list) else { continue }
             if let image = thumbnails[url] {
                 image.draw(in: aspectFit(image.size, in: NSRect(x: row.minX + 6, y: row.minY + 4, width: 32, height: 32)),
                            from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
@@ -191,7 +225,13 @@ final class FloatView: NSView, NSDraggingSource {
     }
 
     private func rowRect(_ index: Int) -> NSRect {
-        NSRect(x: 4, y: header + CGFloat(index) * rowHeight, width: bounds.width - 8, height: rowHeight)
+        NSRect(x: 4, y: header + CGFloat(index) * rowHeight - scrollOffset, width: bounds.width - 8, height: rowHeight)
+    }
+
+    /// The row under a point, ignoring rows scrolled up behind the header.
+    func row(at point: NSPoint) -> Int? {
+        guard point.y >= header else { return nil }
+        return urls.indices.first { rowRect($0).contains(point) }
     }
 
     private func drawText(_ text: String, in rect: NSRect, size: CGFloat, centered: Bool) {
@@ -221,7 +261,7 @@ final class FloatView: NSView, NSDraggingSource {
         mouseDownPoint = nil
         var dragged = urls
         draggedRow = nil
-        if expanded, let row = urls.indices.first(where: { rowRect($0).contains(start) }) {
+        if expanded, let row = row(at: start) {
             dragged = [urls[row]]
             draggedRow = row
         }
@@ -249,8 +289,11 @@ final class FloatView: NSView, NSDraggingSource {
     @objc private func reveal() { NSWorkspace.shared.activateFileViewerSelecting(urls) }
     @objc private func copyFiles() { MainActor.assumeIsolated { FileActions.copyFiles(urls) } }
     @objc private func closeClicked() { onEmpty?() }
+    func toggleExpandedForTesting() { toggleExpanded() }
+
     @objc private func toggleExpanded() {
         expanded.toggle()
+        scrollOffset = 0
         expandButton.toolTip = expanded ? "Show as stack" : "Show as list"
         relayout()
     }

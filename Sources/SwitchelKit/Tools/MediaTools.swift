@@ -310,6 +310,28 @@ enum AudioTools {
         return try await filter(url, "\(remove),areverse,\(remove),areverse", suffix: "trimmed")
     }
 
+    /// Trims to `range`, then removes the silent ends, leaving one "trimmed" file.
+    static func trim(_ url: URL, _ range: ClosedRange<Double>, thenSilenceBelow threshold: Double) async throws -> URL {
+        let trimmed = try await trim(url, range)
+        do {
+            let quiet = try await trimSilence(trimmed, threshold: threshold)
+            try FileManager.default.removeItem(at: trimmed)
+            try FileManager.default.moveItem(at: quiet, to: trimmed)
+            return trimmed
+        } catch {
+            try? FileManager.default.removeItem(at: trimmed)
+            throw error
+        }
+    }
+
+    /// The stretch "Add Bleep at Playhead" covers, or nil at the very end. A VBR file's playhead
+    /// can run past its reported duration, which would otherwise make the range's start pass its end.
+    static func bleepRange(at time: Double, duration: Double, length: Double = 0.6) -> ClosedRange<Double>? {
+        guard time.isFinite, duration.isFinite else { return nil }
+        let start = max(time, 0), end = min(start + length, duration)
+        return start < end ? start...end : nil
+    }
+
     // MARK: Volume, channels
 
     /// EBU R128 loudness. -16 LUFS suits spoken audio and music; the true-peak ceiling prevents clipping after encoding.

@@ -26,8 +26,9 @@ enum TextTools {
         text.enumerateSubstrings(in: text.startIndex..., options: [.byWords, .substringNotRequired]) { _, _, _, _ in stats.words += 1 }
         stats.characters = text.count
         stats.charactersWithoutSpaces = text.filter { !$0.isWhitespace }.count
-        let lines = text.components(separatedBy: .newlines)
-        stats.lines = text.isEmpty ? 0 : lines.count - (text.hasSuffix("\n") ? 1 : 0)
+        let unified = text.unifiedLineEndings
+        let lines = unified.components(separatedBy: .newlines)
+        stats.lines = text.isEmpty ? 0 : lines.count - (unified.hasSuffix("\n") ? 1 : 0)
         stats.paragraphs = lines.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.count
         return stats
     }
@@ -47,10 +48,12 @@ enum TextTools {
 
         /// The pattern as a regular expression, whichever mode is on.
         func expression() throws -> NSRegularExpression {
-            var pattern = regularExpression ? find : NSRegularExpression.escapedPattern(for: find)
-            if wholeWords { pattern = "\\b\(pattern)\\b" }
+            let pattern = regularExpression ? find : NSRegularExpression.escapedPattern(for: find)
+            let options: NSRegularExpression.Options = caseSensitive ? [] : [.caseInsensitive]
             do {
-                return try NSRegularExpression(pattern: pattern, options: caseSensitive ? [] : [.caseInsensitive])
+                // Checked alone first, because the group below could balance a pattern like "a)|(b".
+                let plain = try NSRegularExpression(pattern: pattern, options: options)
+                return wholeWords ? try NSRegularExpression(pattern: "\\b(?:\(pattern))\\b", options: options) : plain
             } catch {
                 throw SwitchelError("“\(find)” isn't a valid regular expression")
             }
@@ -67,6 +70,11 @@ enum TextTools {
         guard !replacement.find.isEmpty else { throw SwitchelError("Enter something to find") }
         let expression = try replacement.expression()
         let template = replacement.regularExpression ? replacement.replace : NSRegularExpression.escapedTemplate(for: replacement.replace)
+        let word = try await rewriteWord(url, suffix: "edited") { paragraphs in
+            let count = paragraphs.reduce(0) { $0 + $1.replaceMatches(of: expression, template: template) }
+            guard count > 0 else { throw SwitchelError("“\(replacement.find)” wasn't found") }
+        }
+        if let word { return word }
         return try await rewrite(url, suffix: "edited") { text in
             // Back to front, so earlier ranges stay valid.
             let matches = expression.matches(in: text.string, range: NSRange(location: 0, length: text.length))
@@ -94,20 +102,37 @@ enum TextTools {
         }
 
         func apply(_ text: String) -> String {
+            var capitalizeNext = true
+            return apply(text, capitalizeNext: &capitalizeNext)
+        }
+
+        /// One piece of a longer text. `capitalizeNext` carries over, so a word or sentence
+        /// that spans differently formatted runs still comes out right.
+        func apply(_ text: String, capitalizeNext: inout Bool) -> String {
             switch self {
             case .upper: return text.uppercased()
             case .lower: return text.lowercased()
-            case .title: return text.capitalized
+            case .title:
+                var result = ""
+                for character in text {
+                    result += capitalizeNext ? character.uppercased() : character.lowercased()
+                    if character.isLetter || character.isNumber {
+                        capitalizeNext = false
+                    } else if !"'’".contains(character) {
+                        capitalizeNext = true
+                    }
+                }
+                return result
             case .sentence:
-                var result = "", capitalizeNext = true
-                for character in text.lowercased() {
+                var result = ""
+                for character in text {
                     if capitalizeNext && character.isLetter {
                         result += character.uppercased()
                         capitalizeNext = false
                     } else {
-                        result.append(character)
+                        result += character.lowercased()
                     }
-                    if ".!?\n".contains(character) { capitalizeNext = true }
+                    if ".!?".contains(character) || character.isNewline { capitalizeNext = true }
                 }
                 return result
             }
@@ -115,16 +140,21 @@ enum TextTools {
     }
 
     static func changeCase(_ url: URL, to style: Case) async throws -> URL {
-        try await rewrite(url, suffix: style.rawValue) { text in
-            if style == .sentence {
-                text.replaceCharacters(in: NSRange(location: 0, length: text.length), with: style.apply(text.string))
-                return
+        let word = try await rewriteWord(url, suffix: style.rawValue) { paragraphs in
+            for paragraph in paragraphs {
+                var capitalizeNext = true
+                paragraph.mapText { style.apply($0, capitalizeNext: &capitalizeNext) }
             }
+        }
+        if let word { return word }
+        return try await rewrite(url, suffix: style.rawValue) { text in
             // Run by run, so each keeps its formatting.
             var runs: [NSRange] = []
             text.enumerateAttributes(in: NSRange(location: 0, length: text.length)) { _, range, _ in runs.append(range) }
-            for range in runs.reversed() {
-                text.replaceCharacters(in: range, with: style.apply((text.string as NSString).substring(with: range)))
+            var capitalizeNext = true
+            let replacements = runs.map { style.apply((text.string as NSString).substring(with: $0), capitalizeNext: &capitalizeNext) }
+            for (range, replacement) in zip(runs, replacements).reversed() {
+                text.replaceCharacters(in: range, with: replacement)
             }
         }
     }
@@ -139,7 +169,7 @@ enum TextTools {
     }
 
     static func clean(_ text: String, _ options: Cleanup) -> String {
-        var lines = text.components(separatedBy: .newlines)
+        var lines = text.unifiedLineEndings.components(separatedBy: .newlines)
         if options.trimTrailingSpaces {
             lines = lines.map { $0.replacingOccurrences(of: #"[ \t]+$"#, with: "", options: .regularExpression) }
         }
@@ -175,17 +205,54 @@ enum TextTools {
             try (parts.joined(separator: "\n\n") + "\n").write(to: out, atomically: true, encoding: .utf8)
             return out
         }
-        let combined = NSMutableAttributedString()
-        for url in sorted {
-            if combined.length > 0 { combined.append(NSAttributedString(string: "\n\n")) }
-            combined.append(try await DocumentConverter.read(url))
+        // Joined as Word files, so pictures and tables come along.
+        let scratch = try Output.temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        var merged: WordDocument?
+        for (index, url) in sorted.enumerated() {
+            let document = try await WordDocument(try await wordFile(for: url, in: scratch, index: index))
+            if let merged { try merged.append(document) } else { merged = document }
         }
         let out = Output.url(for: sorted[0], ext: "docx", suffix: "merged")
-        try await DocumentConverter.write(combined, as: .docx, to: out, title: Output.baseName(sorted[0]))
+        try await merged?.save(to: out)
         return out
     }
 
     // MARK: Helpers
+
+    /// A Word file with the document's content: itself, Pages' faithful export, or else the text system's.
+    private static func wordFile(for url: URL, in folder: URL, index: Int) async throws -> URL {
+        let ext = Output.normalizedExtension(url)
+        if ext == "docx" { return url }
+        let docx = folder.appendingPathComponent("\(index).docx")
+        if ext == "pages" || (ext == "doc" && IWork.canUse(.pages)) {
+            try await IWork.export(url, with: .pages, to: docx, as: "Microsoft Word")
+        } else {
+            try await DocumentConverter.write(try await DocumentConverter.read(url), as: .docx, to: docx, title: Output.baseName(url))
+        }
+        return docx
+    }
+
+    /// Edits Word and Pages files through Word's XML, keeping pictures and tables the text system would drop.
+    /// Returns nil for other formats. Pages files go through Pages, and come back as Pages files.
+    private static func rewriteWord(_ url: URL, suffix: String, _ edit: ([WordDocument.Paragraph]) throws -> Void) async throws -> URL? {
+        let ext = Output.normalizedExtension(url)
+        guard ext == "docx" || ext == "pages" || (ext == "doc" && IWork.canUse(.pages)) else { return nil }
+        let scratch = try Output.temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let document = try await WordDocument(try await wordFile(for: url, in: scratch, index: 0))
+        try edit(try document.paragraphs())
+        guard ext == "pages" else {
+            let out = Output.url(for: url, ext: "docx", suffix: suffix)
+            try await document.save(to: out)
+            return out
+        }
+        let edited = scratch.appendingPathComponent("\(Output.baseName(url)).docx")
+        try await document.save(to: edited)
+        let out = Output.url(for: url, ext: "pages", suffix: suffix)
+        try await IWork.save(edited, with: .pages, to: out)
+        return out
+    }
 
     /// Reads, edits and writes a copy in the same format.
     private static func rewrite(_ url: URL, suffix: String, _ edit: (NSMutableAttributedString) throws -> Void) async throws -> URL {
@@ -207,10 +274,16 @@ enum TextTools {
 }
 
 enum SubtitleTools {
-    /// Moves every cue by `seconds` (negative is earlier), never before zero.
+    /// Moves every cue by `seconds` (negative is earlier). Cues that end before zero are dropped;
+    /// ones that straddle it start at zero.
     static func shift(_ url: URL, by seconds: Double) throws -> URL {
-        let cues = SubtitleConverter.parse(try String(readingText: url)).map { cue in
-            SubtitleConverter.Cue(start: max(cue.start + seconds, 0), end: max(cue.end + seconds, 0), text: cue.text)
+        let original = SubtitleConverter.parse(try String(readingText: url))
+        let cues = original.compactMap { cue -> SubtitleConverter.Cue? in
+            guard cue.end + seconds > 0 else { return nil }
+            return SubtitleConverter.Cue(start: max(cue.start + seconds, 0), end: cue.end + seconds, text: cue.text)
+        }
+        guard !cues.isEmpty || original.isEmpty else {
+            throw SwitchelError("Shifting by \(seconds) seconds would move every subtitle before the start")
         }
         let format = SubtitleFormat(rawValue: Output.normalizedExtension(url)) ?? .srt
         let out = Output.url(for: url, ext: format.rawValue, suffix: "shifted")
@@ -248,11 +321,27 @@ extension ArchiveConverter {
         } else {
             let scratch = try Output.temporaryFolder()
             defer { try? FileManager.default.removeItem(at: scratch) }
+            var used = Set<String>()
+            var names: [String] = []
             for url in urls {
-                try FileManager.default.createSymbolicLink(at: scratch.appendingPathComponent(url.lastPathComponent), withDestinationURL: url)
+                let name = uniqueName(for: url, taken: &used)
+                try FileManager.default.createSymbolicLink(at: scratch.appendingPathComponent(name), withDestinationURL: url)
+                names.append("./\(name)")
             }
-            try await Shell.run("/usr/bin/zip", ["-rq", out.path] + urls.map(\.lastPathComponent), in: scratch)
+            // "./" keeps a name starting with "-" from being read as an option.
+            try await Shell.run("/usr/bin/zip", ["-rq", out.path] + names, in: scratch)
         }
         return out
+    }
+
+    /// "a.txt", then "a 2.txt". Compared ignoring case, as most Mac disks do.
+    private static func uniqueName(for url: URL, taken: inout Set<String>) -> String {
+        var name = url.lastPathComponent, n = 2
+        while !taken.insert(name.lowercased()).inserted {
+            let base = url.deletingPathExtension().lastPathComponent
+            name = url.pathExtension.isEmpty ? "\(base) \(n)" : "\(base) \(n).\(url.pathExtension)"
+            n += 1
+        }
+        return name
     }
 }

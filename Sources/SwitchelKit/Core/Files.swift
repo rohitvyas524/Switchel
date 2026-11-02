@@ -58,6 +58,28 @@ enum Output {
     /// Where results go; nil saves next to the original. Set from Settings.
     static var folderOverride: URL?
 
+    /// Remembers the results a job has started, so cancelling it can remove them.
+    final class StartedFiles: @unchecked Sendable {
+        private let lock = NSLock()
+        private var urls: [URL] = []
+
+        func add(_ url: URL) {
+            lock.lock()
+            defer { lock.unlock() }
+            urls.append(url)
+        }
+
+        /// Safe because `Output.url` only hands out names that were free.
+        func removeAll() {
+            lock.lock()
+            defer { lock.unlock() }
+            for url in urls { try? FileManager.default.removeItem(at: url) }
+            urls = []
+        }
+    }
+
+    @TaskLocal static var started: StartedFiles?
+
     /// A free URL for a result of `source`: "photo.png" → "photo compressed.jpg", then "photo compressed 2.jpg".
     /// A nil `ext` names a folder.
     static func url(for source: URL, ext: String?, suffix: String? = nil) -> URL {
@@ -73,6 +95,7 @@ enum Output {
             url = candidate("\(base) \(n)")
             n += 1
         }
+        started?.add(url)
         return url
     }
 
@@ -103,6 +126,9 @@ enum Output {
 }
 
 extension String {
+    /// Windows line endings as "\n". Splitting on `.newlines` would otherwise count "\r\n" as two breaks.
+    var unifiedLineEndings: String { replacingOccurrences(of: "\r\n", with: "\n") }
+
     /// Reads a user's text file: UTF-8 or a marked encoding when possible, otherwise Windows-1252,
     /// which covers most older subtitles and spreadsheet exports. Latin-1 decodes any byte as a last resort.
     init(readingText url: URL) throws {

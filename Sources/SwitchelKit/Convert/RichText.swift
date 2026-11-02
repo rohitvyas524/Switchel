@@ -132,7 +132,7 @@ enum Markdown {
             openList = nil
         }
 
-        for line in source.components(separatedBy: .newlines) {
+        for line in source.unifiedLineEndings.components(separatedBy: .newlines) {
             if line.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
                 if let lines = code {
                     html.append("<pre><code>\(lines.joined(separator: "\n").xmlEscaped)</code></pre>")

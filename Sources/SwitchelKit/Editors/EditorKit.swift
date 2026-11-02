@@ -10,21 +10,32 @@ final class ToolSession: ObservableObject {
     @Published var isWorking = false
     @Published var error: String?
     fileprivate var completion: ((Result<[URL], Error>) -> Void)?
+    private var task: Task<Void, Never>?
 
     func run(_ work: @escaping @MainActor () async throws -> [URL]) {
         isWorking = true
         error = nil
-        Task { @MainActor in
+        let started = Output.StartedFiles()
+        task = Task { @MainActor in
             do {
-                finish(.success(try await work()))
+                let urls = try await Output.$started.withValue(started) { try await work() }
+                if Task.isCancelled { started.removeAll() } else { finish(.success(urls)) }
             } catch {
-                isWorking = false
-                self.error = error.localizedDescription
+                if Task.isCancelled {
+                    started.removeAll()
+                } else {
+                    isWorking = false
+                    self.error = error.localizedDescription
+                }
             }
         }
     }
 
-    func cancel() { finish(.failure(CancellationError())) }
+    /// Stops a running save and removes whatever it had written.
+    func cancel() {
+        task?.cancel()
+        finish(.failure(CancellationError()))
+    }
 
     fileprivate func finish(_ result: Result<[URL], Error>) {
         let completion = self.completion

@@ -195,10 +195,7 @@ private struct TrimView: View {
             if isVideo { return [try await VideoTools.trim(url, range)] }
             guard trimSilence else { return [try await AudioTools.trim(url, range)] }
             if isFull { return [try await AudioTools.trimSilence(url, threshold: threshold)] }
-            let trimmed = try await AudioTools.trim(url, range)
-            let quiet = try await AudioTools.trimSilence(trimmed, threshold: threshold)
-            try? FileManager.default.removeItem(at: trimmed)
-            return [quiet]
+            return [try await AudioTools.trim(url, range, thenSilenceBelow: threshold)]
         }
     }
 }
@@ -634,7 +631,8 @@ private struct BleepView: View {
                     Spacer()
                     Text("\(formatTime(selection.lowerBound)) – \(formatTime(selection.upperBound))").monospacedDigit()
                     Button("Add Bleep at Playhead") {
-                        ranges.append(model.time...min(model.time + 0.6, model.duration))
+                        guard let range = AudioTools.bleepRange(at: model.time, duration: model.duration) else { return }
+                        ranges.append(range)
                         ranges.sort { $0.lowerBound < $1.lowerBound }
                     }
                     Button("Add Range") { ranges.append(selection); ranges.sort { $0.lowerBound < $1.lowerBound } }

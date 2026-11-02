@@ -80,7 +80,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Keyboard shortcut
 
     private func registerShortcut() {
-        hotKey = Settings.shared.shortcut.flatMap(HotKey.init)
+        // Release the old one first: the system refuses a second registration of the same keys.
+        hotKey = nil
+        guard let shortcut = Settings.shared.shortcut else { return }
+        hotKey = HotKey(shortcut)
+        if hotKey == nil {
+            Toast.shared.show("Couldn't set the shortcut \(shortcut.display). Another app may be using it.", isError: true)
+        }
     }
 
     private func openWheelForFinderSelection() {

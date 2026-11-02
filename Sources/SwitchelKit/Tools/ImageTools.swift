@@ -24,9 +24,10 @@ enum ImageTools {
         var image = try ImageConverter.load(url, maxPixelSize: options.maxDimension)
         let format = options.format ?? (ImageConverter.hasAlpha(image) ? .heic : .jpg)
         let out = Output.url(for: url, ext: format.rawValue, suffix: "compressed")
+        let metadata = ImageConverter.metadata(of: url)
         switch options.target {
         case .quality(let quality):
-            try await ImageConverter.save(image, to: out, as: format, quality: quality)
+            try await ImageConverter.save(image, to: out, as: format, quality: quality, metadata: metadata)
         case .maxBytes(let limit):
             if format == .webp {
                 let cwebp = try Shell.require("cwebp", brew: "webp")
@@ -39,7 +40,7 @@ enum ImageTools {
             // Lossless formats have no quality to search, so only the pixel size can come down.
             guard format.isLossy else {
                 for _ in 0..<12 {
-                    let data = try ImageConverter.encode(image, type: format.type, quality: 1)
+                    let data = try ImageConverter.encode(image, type: format.type, quality: 1, metadata: metadata)
                     if data.count <= limit {
                         try data.write(to: out)
                         return out
@@ -56,10 +57,10 @@ enum ImageTools {
                 var best: Data?
                 for _ in 0..<7 {
                     let mid = (low + high) / 2
-                    let data = try ImageConverter.encode(image, type: type, quality: mid)
+                    let data = try ImageConverter.encode(image, type: type, quality: mid, metadata: metadata)
                     if data.count <= limit { best = data; low = mid } else { high = mid }
                 }
-                if best == nil, let lowest = try? ImageConverter.encode(image, type: type, quality: 0.05), lowest.count <= limit {
+                if best == nil, let lowest = try? ImageConverter.encode(image, type: type, quality: 0.05, metadata: metadata), lowest.count <= limit {
                     best = lowest
                 }
                 if let best {
@@ -103,12 +104,12 @@ enum ImageTools {
         return try await saveCopy(rotated, of: url, suffix: "rotated")
     }
 
-    /// Saves in the source's format (PNG when we can't write it).
-    static func saveCopy(_ image: CGImage, of url: URL, suffix: String, forceTransparency: Bool = false) async throws -> URL {
+    /// Saves in the source's format (PNG when we can't write it), keeping its capture date and location unless told not to.
+    static func saveCopy(_ image: CGImage, of url: URL, suffix: String, forceTransparency: Bool = false, keepMetadata: Bool = true) async throws -> URL {
         var format = ImageConverter.sameFormat(as: url)
         if forceTransparency && [.jpg, .bmp].contains(format) { format = .png }
         let out = Output.url(for: url, ext: format.rawValue, suffix: suffix)
-        try await ImageConverter.save(image, to: out, as: format, quality: 0.95)
+        try await ImageConverter.save(image, to: out, as: format, quality: 0.95, metadata: keepMetadata ? ImageConverter.metadata(of: url) : nil)
         return out
     }
 
@@ -506,10 +507,33 @@ enum ImageTools {
             throw SwitchelError("Couldn't read \(url.lastPathComponent)")
         }
         let out = Output.url(for: url, ext: url.pathExtension, suffix: changes.removeAll ? "clean" : "edited")
-        guard let dest = CGImageDestinationCreateWithURL(out as CFURL, type, 1, nil) else {
-            // Formats ImageIO can't write (WebP): re-encode instead.
-            return try await saveCopy(try ImageConverter.load(url), of: url, suffix: "clean")
+        if (type as String) == UTType.webP.identifier {
+            // ImageIO can't write WebP, but its metadata lives in chunks beside the pixels.
+            let carrier = try WebPMetadata.carrier(from: source)
+            guard let carrierSource = CGImageSourceCreateWithData(carrier as CFData, nil) else {
+                throw SwitchelError("Couldn't read the metadata in \(url.lastPathComponent)")
+            }
+            let edited = NSMutableData()
+            guard let dest = CGImageDestinationCreateWithData(edited, UTType.jpeg.identifier as CFString, 1, nil),
+                  copyImage(from: carrierSource, to: dest, changes) else {
+                throw SwitchelError("Couldn't save metadata for \(url.lastPathComponent)")
+            }
+            try WebPMetadata.replaceMetadata(of: url, withMetadataOfJPEG: edited as Data, to: out)
+            return out
         }
+        guard let dest = CGImageDestinationCreateWithURL(out as CFURL, type, 1, nil) else {
+            // Other formats ImageIO can't write: re-encoding removes everything, but can't apply edits.
+            guard changes.removeAll else { throw SwitchelError("Switchel can't edit the metadata of \(url.pathExtension.uppercased()) files") }
+            return try await saveCopy(try ImageConverter.load(url), of: url, suffix: "clean", keepMetadata: false)
+        }
+        guard copyImage(from: source, to: dest, changes) else {
+            throw SwitchelError("Couldn't save metadata for \(url.lastPathComponent)")
+        }
+        return out
+    }
+
+    /// Copies the image as it's stored, with `changes` applied to its metadata.
+    private static func copyImage(from source: CGImageSource, to dest: CGImageDestination, _ changes: MetadataChanges) -> Bool {
         let existing = CGImageSourceCopyMetadataAtIndex(source, 0, nil)
         let metadata = changes.removeAll || existing == nil ? CGImageMetadataCreateMutable() : CGImageMetadataCreateMutableCopy(existing!)!
         let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
@@ -535,10 +559,7 @@ enum ImageTools {
             kCGImageMetadataShouldExcludeGPS: changes.removeLocation || changes.removeAll,
             kCGImageMetadataShouldExcludeXMP: changes.removeAll,
         ]
-        guard CGImageDestinationCopyImageSource(dest, source, options as CFDictionary, nil) else {
-            throw SwitchelError("Couldn't save metadata for \(url.lastPathComponent)")
-        }
-        return out
+        return CGImageDestinationCopyImageSource(dest, source, options as CFDictionary, nil)
     }
 
     // MARK: QR codes

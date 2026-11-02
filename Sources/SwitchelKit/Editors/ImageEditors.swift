@@ -480,7 +480,8 @@ private struct RedactPhotoView: View {
         let regions = regions, style = style
         session.run {
             let redacted = try ImageTools.redact(image.full, regions: regions, style: style)
-            return [try await ImageTools.saveCopy(redacted, of: url, suffix: "redacted")]
+            // Hiding something shouldn't leave the location and camera details behind.
+            return [try await ImageTools.saveCopy(redacted, of: url, suffix: "redacted", keepMetadata: false)]
         }
     }
 }

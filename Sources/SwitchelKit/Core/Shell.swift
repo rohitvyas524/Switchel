@@ -4,44 +4,57 @@ import Foundation
 enum Shell {
     /// Runs a command to completion and returns its standard output.
     /// Fails with the last lines of standard error when it exits non-zero.
+    /// Cancelling the calling task stops the command and throws `CancellationError`.
     @discardableResult
     static func run(_ executable: String, _ arguments: [String], in directory: URL? = nil) async throws -> Data {
-        try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: executable)
-                process.arguments = arguments
-                process.currentDirectoryURL = directory
-                let output = Pipe(), errors = Pipe()
-                process.standardOutput = output
-                process.standardError = errors
-                do {
-                    try process.run()
-                } catch {
-                    continuation.resume(throwing: error)
-                    return
-                }
-                // Drain both pipes concurrently so a chatty tool can't fill one and block.
-                var errorData = Data()
-                let drained = DispatchGroup()
-                drained.enter()
-                DispatchQueue.global().async {
-                    errorData = errors.fileHandleForReading.readDataToEndOfFile()
-                    drained.leave()
-                }
-                let outputData = output.fileHandleForReading.readDataToEndOfFile()
-                drained.wait()
-                process.waitUntilExit()
-
-                if process.terminationStatus == 0 {
-                    continuation.resume(returning: outputData)
-                } else {
-                    let name = URL(fileURLWithPath: executable).lastPathComponent
-                    let detail = String(decoding: errorData, as: UTF8.self)
-                        .split(separator: "\n").suffix(2).joined(separator: " ")
-                    continuation.resume(throwing: SwitchelError("\(name) failed: \(detail.isEmpty ? "exit \(process.terminationStatus)" : detail)"))
+        let running = RunningProcess()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: executable)
+                    process.arguments = arguments
+                    process.currentDirectoryURL = directory
+                    let output = Pipe(), errors = Pipe()
+                    process.standardOutput = output
+                    process.standardError = errors
+                    do {
+                        try running.start(process)
+                    } catch {
+                        continuation.resume(throwing: error)
+                        return
+                    }
+                    finish(process, running, executable, output, errors, continuation)
                 }
             }
+        } onCancel: {
+            running.cancel()
+        }
+    }
+
+    private static func finish(_ process: Process, _ running: RunningProcess, _ executable: String, _ output: Pipe, _ errors: Pipe,
+                               _ continuation: CheckedContinuation<Data, Error>) {
+        // Drain both pipes concurrently so a chatty tool can't fill one and block.
+        var errorData = Data()
+        let drained = DispatchGroup()
+        drained.enter()
+        DispatchQueue.global().async {
+            errorData = errors.fileHandleForReading.readDataToEndOfFile()
+            drained.leave()
+        }
+        let outputData = output.fileHandleForReading.readDataToEndOfFile()
+        drained.wait()
+        process.waitUntilExit()
+
+        if running.isCancelled {
+            continuation.resume(throwing: CancellationError())
+        } else if process.terminationStatus == 0 {
+            continuation.resume(returning: outputData)
+        } else {
+            let name = URL(fileURLWithPath: executable).lastPathComponent
+            let detail = String(decoding: errorData, as: UTF8.self)
+                .split(separator: "\n").suffix(2).joined(separator: " ")
+            continuation.resume(throwing: SwitchelError("\(name) failed: \(detail.isEmpty ? "exit \(process.terminationStatus)" : detail)"))
         }
     }
 
@@ -57,6 +70,34 @@ enum Shell {
             throw SwitchelError("This needs \(name). Install it with “brew install \(formula)”.")
         }
         return path
+    }
+}
+
+/// Lets a cancellation reach a process safely whether or not it has started yet.
+private final class RunningProcess: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func start(_ process: Process) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        if cancelled { throw CancellationError() }
+        try process.run()
+        self.process = process
+    }
+
+    func cancel() {
+        lock.lock()
+        defer { lock.unlock() }
+        cancelled = true
+        if process?.isRunning == true { process?.terminate() }
     }
 }
 

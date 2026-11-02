@@ -46,6 +46,7 @@ enum ImageConverter {
             let png = folder.appendingPathComponent("in.png")
             try write(image, to: png, type: .png)
             try await Shell.run(cwebp, ["-quiet", "-q", String(Int(quality * 100)), "-alpha_q", "100", png.path, "-o", url.path])
+            if let metadata { try WebPMetadata.embed(metadata, in: url) }
         default:
             try write(image, to: url, type: format.type, quality: format.isLossy ? quality : nil, metadata: metadata)
         }
@@ -62,18 +63,26 @@ enum ImageConverter {
             tiff[kCGImagePropertyTIFFOrientation] = 1
             kept[kCGImagePropertyTIFFDictionary] = tiff
         }
+        // A crop or compress changes the size, so the source's would be wrong.
+        if var exif = kept[kCGImagePropertyExifDictionary] as? [CFString: Any] {
+            exif[kCGImagePropertyExifPixelXDimension] = nil
+            exif[kCGImagePropertyExifPixelYDimension] = nil
+            kept[kCGImagePropertyExifDictionary] = exif
+        }
         kept[kCGImagePropertyOrientation] = 1
         return kept
     }
 
     /// Encodes into memory, for compression's size search.
-    static func encode(_ image: CGImage, type: UTType, quality: Double) throws -> Data {
+    static func encode(_ image: CGImage, type: UTType, quality: Double, metadata: [CFString: Any]? = nil) throws -> Data {
         let data = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(data, type.identifier as CFString, 1, nil) else {
             throw SwitchelError("Can't encode \(type.preferredFilenameExtension ?? "images")")
         }
         let image = [UTType.jpeg, .bmp].contains(type) ? flattened(image) : image
-        CGImageDestinationAddImage(dest, image, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
+        var props = metadata ?? [:]
+        props[kCGImageDestinationLossyCompressionQuality] = quality
+        CGImageDestinationAddImage(dest, image, props as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { throw SwitchelError("Couldn't encode image") }
         return data as Data
     }
